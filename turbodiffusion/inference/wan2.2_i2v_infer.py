@@ -188,6 +188,8 @@ if __name__ == "__main__":
                     generator=generator,
                 )
     samples = x.float()
+    low_noise_model.cpu()
+    torch.cuda.empty_cache()
 
     video = tokenizer.decode(samples)
 
