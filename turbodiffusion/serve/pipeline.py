@@ -79,13 +79,17 @@ def generate_t2v(models: dict, args: argparse.Namespace, prompt: str, output_pat
 
     w, h = VIDEO_RES_SIZE_INFO[args.resolution][args.aspect_ratio]
 
-    log.info("Computing text embedding...")
+    log.info(f"Computing embedding for prompt: {args.prompt}")
     with torch.no_grad():
         text_emb = get_umt5_embedding(
             checkpoint_path=args.text_encoder_path,
             prompts=prompt
         ).to(**tensor_kwargs)
+    # Don't clear memory here to avoid re-initializing the model for each prompt
+    # TODO: adaptively offload t5_encoder to CPU when memory runs low
+    # clear_umt5_memory()
 
+    log.info(f"Generating with prompt: {args.prompt}")
     condition = {
         "crossattn_emb": repeat(
             text_emb.to(**tensor_kwargs),
@@ -112,14 +116,19 @@ def generate_t2v(models: dict, args: argparse.Namespace, prompt: str, output_pat
         generator=generator,
     )
 
+    # mid_t = [1.3, 1.0, 0.6][: args.num_steps - 1]
+    # For better visual quality
     mid_t = [1.5, 1.4, 1.0][: args.num_steps - 1]
+
     t_steps = torch.tensor(
         [math.atan(args.sigma_max), *mid_t, 0],
         dtype=torch.float64,
         device=init_noise.device,
     )
+    # Convert TrigFlow timesteps to RectifiedFlow
     t_steps = torch.sin(t_steps) / (torch.cos(t_steps) + torch.sin(t_steps))
 
+    # Sampling steps
     x = init_noise.to(torch.float64) * t_steps[0]
     ones = torch.ones(x.size(0), 1, device=x.device, dtype=x.dtype)
     total_steps = t_steps.shape[0] - 1
@@ -169,19 +178,25 @@ def generate_i2v(models: dict, args: argparse.Namespace, prompt: str,
     low_noise_model = models["low_noise_model"]
     tokenizer = models["tokenizer"]
 
-    log.info("Computing text embedding...")
+    log.info(f"Computing embedding for prompt: {args.prompt}")
     with torch.no_grad():
         text_emb = get_umt5_embedding(
             checkpoint_path=args.text_encoder_path,
             prompts=prompt
         ).to(**tensor_kwargs)
+    # Don't clear memory here to avoid re-initializing the model for each prompt
+    # TODO: adaptively offload t5_encoder to CPU when memory runs low
+    # clear_umt5_memory()
 
-    log.info(f"Loading image from {image_path}")
+    log.info(f"Loading and preprocessing image from: {args.image_path}")
     input_image = Image.open(image_path).convert("RGB")
 
     if args.adaptive_resolution:
+        log.info("Adaptive resolution mode enabled.")
         base_w, base_h = VIDEO_RES_SIZE_INFO[args.resolution][args.aspect_ratio]
         max_resolution_area = base_w * base_h
+        log.info(f"Target area is based on {args.resolution} {args.aspect_ratio} (~{max_resolution_area} pixels).")
+
         orig_w, orig_h = input_image.size
         image_aspect_ratio = orig_h / orig_w
         ideal_w = np.sqrt(max_resolution_area / image_aspect_ratio)
@@ -191,15 +206,17 @@ def generate_i2v(models: dict, args: argparse.Namespace, prompt: str,
         lat_w = round(ideal_w / stride)
         h = lat_h * stride
         w = lat_w * stride
-        log.info(f"Adaptive resolution: {w}x{h}")
+        log.info(f"Input image aspect ratio: {image_aspect_ratio:.4f}. Adaptive resolution set to: {w}x{h}")
     else:
+        log.info("Fixed resolution mode.")
         w, h = VIDEO_RES_SIZE_INFO[args.resolution][args.aspect_ratio]
-
+        log.info(f"Resolution set to: {w}x{h}")
     F = args.num_frames
     lat_h = h // tokenizer.spatial_compression_factor
     lat_w = w // tokenizer.spatial_compression_factor
     lat_t = tokenizer.get_latent_num_frames(F)
 
+    log.info(f"Preprocessing image to {w}x{h}...")
     image_transforms = T.Compose([
         T.ToImage(),
         T.Resize(size=(h, w), antialias=True),
@@ -210,14 +227,14 @@ def generate_i2v(models: dict, args: argparse.Namespace, prompt: str,
         device=tensor_kwargs["device"], dtype=torch.float32
     )
 
-    log.info("Encoding image...")
     with torch.no_grad():
         frames_to_encode = torch.cat(
             [image_tensor.unsqueeze(2),
              torch.zeros(1, 3, F - 1, h, w, device=image_tensor.device)],
             dim=2
-        )
-        encoded_latents = tokenizer.encode(frames_to_encode)
+        )  # -> B, C, T, H, W
+        encoded_latents = tokenizer.encode(frames_to_encode)  # -> B, C_lat, T_lat, H_lat, W_lat
+
         del frames_to_encode
         torch.cuda.empty_cache()
 
@@ -228,6 +245,7 @@ def generate_i2v(models: dict, args: argparse.Namespace, prompt: str,
     y = torch.cat([msk, encoded_latents.to(**tensor_kwargs)], dim=1)
     y = y.repeat(args.num_samples, 1, 1, 1, 1)
 
+    log.info(f"Generating with prompt: {args.prompt}")
     condition = {
         "crossattn_emb": repeat(
             text_emb.to(**tensor_kwargs),
@@ -251,17 +269,18 @@ def generate_i2v(models: dict, args: argparse.Namespace, prompt: str,
     )
 
     mid_t = [1.5, 1.4, 1.0][: args.num_steps - 1]
+
     t_steps = torch.tensor(
         [math.atan(args.sigma_max), *mid_t, 0],
         dtype=torch.float64,
         device=init_noise.device,
     )
+    # Convert TrigFlow timesteps to RectifiedFlow
     t_steps = torch.sin(t_steps) / (torch.cos(t_steps) + torch.sin(t_steps))
 
     x = init_noise.to(torch.float64) * t_steps[0]
     ones = torch.ones(x.size(0), 1, device=x.device, dtype=x.dtype)
     total_steps = t_steps.shape[0] - 1
-
     high_noise_model.cuda()
     net = high_noise_model
     switched = False
@@ -297,7 +316,6 @@ def generate_i2v(models: dict, args: argparse.Namespace, prompt: str,
                 )
 
     samples = x.float()
-
     if switched:
         low_noise_model.cpu()
     else:
